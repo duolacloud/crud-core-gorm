@@ -1,4 +1,4 @@
-package repositories
+package repositories_test
 
 import (
 	"context"
@@ -9,10 +9,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/duolacloud/crud-core-gorm/repositories"
+	"github.com/duolacloud/crud-core/datasource"
 	"github.com/duolacloud/crud-core/types"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
-	mysql "gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
@@ -72,7 +74,7 @@ func (user *OrganizationEntity) TableName() string {
 	return "organizations"
 }
 
-func SetupDB() *gorm.DB {
+func SetupDB() datasource.DataSource[gorm.DB] {
 	newLogger := logger.New(
 		log.New(os.Stdout, "\r\n", log.LstdFlags), // io writer
 		logger.Config{
@@ -83,8 +85,8 @@ func SetupDB() *gorm.DB {
 		},
 	)
 
-	dsn := "root:root@(localhost)/test?charset=utf8mb4&parseTime=True&loc=Local"
-	db, dberr := gorm.Open(mysql.Open(dsn), &gorm.Config{
+	dsn := "host=localhost user=postgres password=postgres dbname=test port=5432 sslmode=disable TimeZone=Asia/Shanghai"
+	db, dberr := gorm.Open(postgres.Open(dsn), &gorm.Config{
 		Logger: newLogger,
 	})
 	if dberr != nil {
@@ -96,20 +98,18 @@ func SetupDB() *gorm.DB {
 		panic(dberr)
 	}
 
-	return db
+	db = db.Debug()
+	dc := datasource.NewDataSource(db)
+	return dc
 }
 
 func TestCreateMany(t *testing.T) {
 	db := SetupDB()
 
-	r := NewGormCrudRepository[UserEntity, UserEntity, map[string]any](db)
-	// identityRepo := NewGormCrudRepository[IdentityEntity, IdentityEntity, IdentityEntity](db)
+	r := repositories.NewGormCrudRepository[UserEntity, UserEntity, map[string]any](db)
+	// identityRepo := repositories.NewGormCrudRepository[IdentityEntity, IdentityEntity, IdentityEntity](db)
 
 	c := context.TODO()
-
-	for i := 1; i <= 5; i++ {
-		_ = r.Delete(c, fmt.Sprintf("%v", i))
-	}
 
 	birthday, _ := time.Parse("2006-01-02 15:04:05", "1989-03-02 12:00:01")
 	t.Logf("birthday: %s\n", birthday)
@@ -135,6 +135,12 @@ func TestCreateMany(t *testing.T) {
 
 	createdUsers, err := r.CreateMany(c, users, types.WithCreateBatchSize(3))
 	assert.NoError(t, err)
+	defer func() {
+		for _, u := range createdUsers {
+			_ = r.Delete(c, u.ID)
+		}
+	}()
+
 	for _, u := range createdUsers {
 		t.Logf("批量创建用户: %v\n", u)
 	}
@@ -142,22 +148,33 @@ func TestCreateMany(t *testing.T) {
 
 func TestGormCursorQuery(t *testing.T) {
 	db := SetupDB()
-	r := NewGormCrudRepository[UserEntity, UserEntity, map[string]any](db)
+	r := repositories.NewGormCrudRepository[UserEntity, UserEntity, map[string]any](db)
 	c := context.TODO()
 
-	// for i := 0; i < 20; i++ {
-	// 	r.Create(c, &UserEntity{
-	// 		ID:       fmt.Sprintf("%d", i),
-	// 		Name:     fmt.Sprintf("name%d", i),
-	// 		Birthday: time.Now().Add(time.Duration(i) * time.Hour),
-	// 	})
-	// }
+	createdUsers := make([]*UserEntity, 0)
+	defer func() {
+		for _, u := range createdUsers {
+			if u != nil {
+				r.Delete(c, u.ID)
+			}
+		}
+	}()
+
+	for i := 0; i < 20; i++ {
+		u, err := r.Create(c, &UserEntity{
+			ID:       fmt.Sprintf("%d", i),
+			Name:     fmt.Sprintf("name%d", i),
+			Birthday: time.Now().Add(time.Duration(i) * time.Hour),
+		})
+		assert.Nil(t, err)
+		createdUsers = append(createdUsers, u)
+	}
 
 	users, extra, err := r.CursorQuery(c, &types.CursorQuery{
 		Filter:    map[string]any{"name": map[string]any{"like": "name%"}},
 		Limit:     5,
 		Direction: types.CursorDirectionAfter,
-		Sort:      []string{"-birthday", "+name"},
+		Sort:      []string{"-users.birthday", "+name"},
 	})
 	assert.Nil(t, err)
 	assert.Equal(t, true, extra.HasNext)
@@ -178,8 +195,8 @@ func TestGormCursorQuery(t *testing.T) {
 func TestGormCrudRepository(t *testing.T) {
 	db := SetupDB()
 
-	r := NewGormCrudRepository[UserEntity, UserEntity, map[string]any](db)
-	// identityRepo := NewGormCrudRepository[IdentityEntity, IdentityEntity, IdentityEntity](db)
+	r := repositories.NewGormCrudRepository[UserEntity, UserEntity, map[string]any](db)
+	// identityRepo := repositories.NewGormCrudRepository[IdentityEntity, IdentityEntity, IdentityEntity](db)
 
 	c := context.TODO()
 
@@ -202,7 +219,12 @@ func TestGormCrudRepository(t *testing.T) {
 			},
 		},
 	})
+
 	assert.NoError(t, err)
+	defer func() {
+		_ = r.Delete(c, u.ID)
+	}()
+
 	t.Logf("创建用户: %v\n", u)
 
 	// update
@@ -285,22 +307,30 @@ func TestRelations(t *testing.T) {
 
 	c := context.TODO()
 
-	orgRepo := NewGormCrudRepository[OrganizationEntity, OrganizationEntity, OrganizationEntity](db)
-	memberRepo := NewGormCrudRepository[OrganizationMemberEntity, OrganizationMemberEntity, OrganizationMemberEntity](db)
-
-	_ = orgRepo.Delete(c, "1")
-	_ = memberRepo.Delete(c, "1")
+	orgRepo := repositories.NewGormCrudRepository[OrganizationEntity, OrganizationEntity, OrganizationEntity](db)
+	memberRepo := repositories.NewGormCrudRepository[OrganizationMemberEntity, OrganizationMemberEntity, OrganizationMemberEntity](db)
+	userRepo := repositories.NewGormCrudRepository[UserEntity, UserEntity, UserEntity](db)
 
 	org, err := orgRepo.Create(c, &OrganizationEntity{
 		ID:   "1",
 		Name: "组织1",
 	})
 
-	if err != nil {
-		t.Error(err)
-	}
+	assert.NoError(t, err)
+	defer func() {
+		_ = orgRepo.Delete(c, org.ID)
+	}()
 
 	t.Logf("创建组织: %v\n", org)
+
+	user, err := userRepo.Create(c, &UserEntity{
+		ID:   "1",
+		Name: "user1",
+	})
+	assert.NoError(t, err)
+	defer func() {
+		_ = userRepo.Delete(c, user.ID)
+	}()
 
 	member, err := memberRepo.Create(c, &OrganizationMemberEntity{
 		ID:             "1",
@@ -309,10 +339,10 @@ func TestRelations(t *testing.T) {
 		UserID:         "1",
 	})
 
-	if err != nil {
-		t.Error(err)
-	}
-
+	assert.NoError(t, err)
+	defer func() {
+		_ = memberRepo.Delete(c, member.ID)
+	}()
 	t.Logf("创建成员: %v\n", member)
 
 	query := &types.PageQuery{
@@ -341,9 +371,7 @@ func TestRelations(t *testing.T) {
 	}
 
 	members, err := memberRepo.Query(c, query)
-	if err != nil {
-		t.Error(err)
-	}
+	assert.NoError(t, err)
 
 	for _, m := range members {
 		t.Logf("成员: %v\n", m)
@@ -351,9 +379,7 @@ func TestRelations(t *testing.T) {
 
 	{
 		member, err := memberRepo.QueryOne(c, query.Filter)
-		if err != nil {
-			t.Error(err)
-		}
+		assert.NoError(t, err)
 
 		t.Logf("queryOne: %v\n", member)
 	}
@@ -362,7 +388,31 @@ func TestRelations(t *testing.T) {
 func TestCount(t *testing.T) {
 	db := SetupDB()
 
-	memberRepo := NewGormCrudRepository[OrganizationMemberEntity, OrganizationMemberEntity, OrganizationMemberEntity](db)
+	memberRepo := repositories.NewGormCrudRepository[OrganizationMemberEntity, OrganizationMemberEntity, OrganizationMemberEntity](db)
+	orgRepo := repositories.NewGormCrudRepository[OrganizationEntity, OrganizationEntity, OrganizationEntity](db)
+	userRepo := repositories.NewGormCrudRepository[UserEntity, UserEntity, UserEntity](db)
+
+	mem, err := memberRepo.Create(context.TODO(), &OrganizationMemberEntity{
+		ID:             "1",
+		Name:           "成员",
+		OrganizationID: "1",
+		UserID:         "1",
+		User: &UserEntity{
+			ID:   "1",
+			Name: "user1",
+		},
+		Organization: &OrganizationEntity{
+			ID:   "1",
+			Name: "org1",
+		},
+	})
+
+	assert.NoError(t, err)
+	defer func() {
+		memberRepo.Delete(context.TODO(), mem.ID)
+		orgRepo.Delete(context.TODO(), mem.OrganizationID)
+		userRepo.Delete(context.TODO(), mem.UserID)
+	}()
 
 	query := &types.PageQuery{
 		Fields: []string{
@@ -385,9 +435,8 @@ func TestCount(t *testing.T) {
 	}
 
 	count, err := memberRepo.Count(context.TODO(), query)
-	if err != nil {
-		t.Error(err)
-	}
+	assert.NoError(t, err)
+	assert.Equal(t, int64(1), count)
 
 	t.Logf("count: %v\n", count)
 }
@@ -395,7 +444,7 @@ func TestCount(t *testing.T) {
 func TestAggregate(t *testing.T) {
 	db := SetupDB()
 
-	userRepo := NewGormCrudRepository[UserEntity, UserEntity, map[string]any](db)
+	userRepo := repositories.NewGormCrudRepository[UserEntity, UserEntity, map[string]any](db)
 
 	query := &types.PageQuery{
 		Fields: []string{
@@ -427,15 +476,13 @@ func TestAggregate(t *testing.T) {
 			"age",
 		},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+
+	assert.NoError(t, err)
 
 	for _, agg := range aggs {
 		js, err := json.Marshal(agg)
-		if err != nil {
-			t.Fatal(err)
-		}
+
+		assert.NoError(t, err)
 
 		t.Logf("聚合: %v\n", string(js))
 	}
@@ -444,7 +491,7 @@ func TestAggregate(t *testing.T) {
 func TestGet(t *testing.T) {
 	db := SetupDB()
 
-	r := NewGormCrudRepository[UserEntity, UserEntity, map[string]any](db)
+	r := repositories.NewGormCrudRepository[UserEntity, UserEntity, map[string]any](db)
 
 	c := context.TODO()
 
@@ -465,6 +512,7 @@ func TestGet(t *testing.T) {
 		},
 	}
 	r.Create(c, user)
+	defer r.Delete(c, userID)
 
 	gotUser, err := r.Get(c, userID)
 	assert.Nil(t, err)
@@ -477,7 +525,7 @@ func TestGet(t *testing.T) {
 	_, err = r.Get(c, "Where 1 = 1")
 	assert.ErrorIs(t, err, types.ErrNotFound)
 
-	relationRepo := NewGormCrudRepository[UserRelationEntity, UserRelationEntity, map[string]any](db)
+	relationRepo := repositories.NewGormCrudRepository[UserRelationEntity, UserRelationEntity, map[string]any](db)
 
 	from := uuid.NewString()
 	to := uuid.NewString()
@@ -487,6 +535,7 @@ func TestGet(t *testing.T) {
 		Status: true,
 	}
 	relationRepo.Create(c, relation)
+	defer relationRepo.Delete(c, relation)
 
 	_, err = relationRepo.Get(c, "123")
 	assert.NotNil(t, err)
